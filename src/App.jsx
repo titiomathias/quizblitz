@@ -1,25 +1,41 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { ref, push, onChildAdded, off, remove } from "firebase/database";
+import { db } from "./firebase";
 import "./styles.css";
 
 // ─── Utility helpers ───
 const generateRoomCode = () => String(Math.floor(100000 + Math.random() * 900000));
 const COLORS = ["#e21b3c", "#1368ce", "#d89e00", "#26890c"];
 const SHAPES = ["▲", "◆", "●", "■"];
-const CHANNEL_NAME = "quizblitz-channel";
+const SENDER_ID = Math.random().toString(36).substring(2, 15);
 
-// ─── BroadcastChannel Communication Layer ───
-function useBroadcast(roomCode, onMessage) {
-  const channelRef = useRef(null);
+// ─── Firebase Communication Layer ───
+function useFirebase(roomCode, onMessage) {
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
+
   useEffect(() => {
-    if (!roomCode) return;
-    const ch = new BroadcastChannel(`${CHANNEL_NAME}-${roomCode}`);
-    channelRef.current = ch;
-    ch.onmessage = (e) => onMessage(e.data);
-    return () => ch.close();
+    if (!roomCode || roomCode.length < 6) return;
+    const messagesRef = ref(db, `rooms/${roomCode}/messages`);
+
+    const callback = (snapshot) => {
+      const msg = snapshot.val();
+      if (msg.senderId !== SENDER_ID) {
+        onMessageRef.current(msg);
+      }
+    };
+
+    onChildAdded(messagesRef, callback);
+
+    return () => off(messagesRef, "child_added", callback);
   }, [roomCode]);
+
   const send = useCallback((msg) => {
-    channelRef.current?.postMessage(msg);
-  }, []);
+    if (!roomCode) return;
+    const messagesRef = ref(db, `rooms/${roomCode}/messages`);
+    push(messagesRef, { ...msg, senderId: SENDER_ID });
+  }, [roomCode]);
+
   return send;
 }
 
@@ -275,7 +291,7 @@ export default function App() {
     }
   }, [playerName]);
 
-  const send = useBroadcast(roomCode || joinCode, handleMessage);
+  const send = useFirebase(roomCode || joinCode, handleMessage);
 
   // Sync player list to clients
   useEffect(() => {
@@ -301,8 +317,12 @@ export default function App() {
         if (!q.time) q.time = 20;
       }
       setJsonError("");
-      setQuiz(parsed);
       const code = generateRoomCode();
+
+      // Clear previous room data in Firebase if any
+      remove(ref(db, `rooms/${code}`));
+
+      setQuiz(parsed);
       setRoomCode(code);
       setIsHost(true);
       setPlayers({});
@@ -323,12 +343,14 @@ export default function App() {
     setMyScore(0);
     setMyStreak(0);
     setScreen("player-lobby");
-    setTimeout(() => {
-      const ch = new BroadcastChannel(`${CHANNEL_NAME}-${joinCode}`);
-      ch.postMessage({ type: "PLAYER_JOIN", name: playerName.trim() });
-      ch.close();
-    }, 100);
   }
+
+  // Notify host about player joining
+  useEffect(() => {
+    if (screen === "player-lobby" && roomCode && playerName && !isHost) {
+      send({ type: "PLAYER_JOIN", name: playerName.trim() });
+    }
+  }, [screen, roomCode, playerName, isHost, send]);
 
   // ─── Host: Start Game ───
   function handleStartGame() {
