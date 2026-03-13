@@ -18,8 +18,18 @@ function useFirebase(roomCode, onMessage) {
     if (!roomCode || roomCode.length < 6) return;
     const messagesRef = ref(db, `rooms/${roomCode}/messages`);
 
+    // Record when the listener was attached so we can skip messages that
+    // already existed in Firebase (prevents stale-message replay on attach
+    // and covers the race window between remove() and onChildAdded()).
+    const attachedAt = Date.now();
+
     const callback = (snapshot) => {
       const msg = snapshot.val();
+      if (!msg) return;
+      // Skip messages older than 5 s relative to when we attached.
+      // This discards any pre-existing children fired by onChildAdded on
+      // attach, while still accepting messages sent around the same time.
+      if (msg.ts && msg.ts < attachedAt - 5000) return;
       if (msg.senderId !== SENDER_ID) {
         onMessageRef.current(msg);
       }
@@ -33,7 +43,8 @@ function useFirebase(roomCode, onMessage) {
   const send = useCallback((msg) => {
     if (!roomCode) return;
     const messagesRef = ref(db, `rooms/${roomCode}/messages`);
-    push(messagesRef, { ...msg, senderId: SENDER_ID });
+    // Include a client-side timestamp so receivers can filter stale messages.
+    push(messagesRef, { ...msg, senderId: SENDER_ID, ts: Date.now() });
   }, [roomCode]);
 
   return send;
@@ -212,35 +223,27 @@ export default function App() {
   const quizRef = useRef(null);
   const currentQRef = useRef(0);
   const playersRef = useRef({});
+  const isHostRef = useRef(false);
 
   // Keep refs in sync
   useEffect(() => { quizRef.current = quiz; }, [quiz]);
   useEffect(() => { currentQRef.current = currentQ; }, [currentQ]);
   useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => { isHostRef.current = isHost; }, [isHost]);
 
   // ─── Broadcast handler ───
+  // Uses isHostRef (not the closed-over isHost) so the callback never goes
+  // stale between renders and role-based guards are always up-to-date.
   const handleMessage = useCallback((msg) => {
+    const asHost = isHostRef.current;
     switch (msg.type) {
+      // ── Messages only the HOST should process (sent by players) ──
       case "PLAYER_JOIN":
+        if (!asHost) break;
         setPlayers((prev) => ({ ...prev, [msg.name]: { score: 0, streak: 0, lastAnswer: null } }));
         break;
-      case "PLAYER_LIST":
-        setPlayers(msg.players);
-        break;
-      case "GAME_START":
-        setQuiz(msg.quiz);
-        setScreen("countdown");
-        setCountdownVal(3);
-        break;
-      case "NEXT_QUESTION":
-        setCurrentQ(msg.qIndex);
-        setTimeLeft(msg.time);
-        setSelectedAnswer(null);
-        setShowCorrect(false);
-        setWasCorrect(null);
-        setScreen("question");
-        break;
       case "PLAYER_ANSWER":
+        if (!asHost) break;
         setPlayers((prev) => {
           const p = { ...prev };
           if (p[msg.name]) {
@@ -263,29 +266,56 @@ export default function App() {
         });
         setAnsweredCount((c) => c + 1);
         break;
+
+      // ── Messages only PLAYERS should process (sent by the host) ──
+      case "PLAYER_LIST":
+        if (asHost) break;
+        if (msg.players && typeof msg.players === "object" && !Array.isArray(msg.players)) {
+          setPlayers(msg.players);
+        }
+        break;
+      case "GAME_START":
+        if (asHost) break;
+        setQuiz(msg.quiz);
+        setScreen("countdown");
+        setCountdownVal(3);
+        break;
+      case "NEXT_QUESTION":
+        if (asHost) break;
+        setCurrentQ(msg.qIndex);
+        setTimeLeft(msg.time);
+        setSelectedAnswer(null);
+        setShowCorrect(false);
+        setWasCorrect(null);
+        setScreen("question");
+        break;
       case "SHOW_RESULTS":
-        if (msg.players) {
+        if (asHost) break;
+        if (msg.players && typeof msg.players === "object") {
           setPlayers(msg.players);
           const me = msg.players[playerName];
           if (me) {
             setMyScore(me.score);
             setMyStreak(me.streak);
             setLastPoints(me.lastPoints || 0);
-            setWasCorrect(me.lastCorrect);
+            setWasCorrect(me.lastCorrect ?? null);
           }
         }
         setShowCorrect(true);
         setScreen("answer-result");
         break;
       case "SHOW_SCOREBOARD":
-        if (msg.players) setPlayers(msg.players);
+        if (asHost) break;
+        if (msg.players && typeof msg.players === "object") setPlayers(msg.players);
         setScreen("scoreboard");
         break;
       case "SHOW_FINAL":
-        if (msg.players) setPlayers(msg.players);
+        if (asHost) break;
+        if (msg.players && typeof msg.players === "object") setPlayers(msg.players);
         setScreen("final");
         break;
       case "TIME_UPDATE":
+        if (asHost) break;
         setTimeLeft(msg.timeLeft);
         break;
     }
@@ -301,7 +331,7 @@ export default function App() {
   }, [players, isHost, send]);
 
   // ─── Host: Create Room ───
-  function handleCreateQuiz() {
+  async function handleCreateQuiz() {
     try {
       const parsed = JSON.parse(jsonText);
       if (!parsed.title || !parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
@@ -319,8 +349,9 @@ export default function App() {
       setJsonError("");
       const code = generateRoomCode();
 
-      // Clear previous room data in Firebase if any
-      remove(ref(db, `rooms/${code}`));
+      // Await the removal so the listener never attaches to a path that still
+      // has messages from a previous session with the same code.
+      try { await remove(ref(db, `rooms/${code}`)); } catch (_) { /* ignore */ }
 
       setQuiz(parsed);
       setRoomCode(code);
@@ -459,8 +490,11 @@ export default function App() {
     send({ type: "SHOW_RESULTS", players });
   }
 
-  const sortedPlayers = Object.entries(players)
-    .map(([name, data]) => ({ name, ...data }))
+  const sortedPlayers = (players && typeof players === "object" && !Array.isArray(players)
+    ? Object.entries(players)
+    : []
+  )
+    .map(([name, data]) => ({ name, ...(data || {}) }))
     .sort((a, b) => (b.score || 0) - (a.score || 0));
 
   function goHome() {
