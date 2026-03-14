@@ -224,12 +224,19 @@ export default function App() {
   const currentQRef = useRef(0);
   const playersRef = useRef({});
   const isHostRef = useRef(false);
+  const timeLeftRef = useRef(0);
+  const screenRef = useRef("home");
+  const showCorrectRef = useRef(false);
+  const isRejoinRef = useRef(false);
 
   // Keep refs in sync
   useEffect(() => { quizRef.current = quiz; }, [quiz]);
   useEffect(() => { currentQRef.current = currentQ; }, [currentQ]);
   useEffect(() => { playersRef.current = players; }, [players]);
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+  useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+  useEffect(() => { showCorrectRef.current = showCorrect; }, [showCorrect]);
 
   // ─── Broadcast handler ───
   // Uses isHostRef (not the closed-over isHost) so the callback never goes
@@ -277,17 +284,85 @@ export default function App() {
       case "GAME_START":
         if (asHost) break;
         setQuiz(msg.quiz);
+        setCurrentQ(0);
+        currentQRef.current = 0;
         setScreen("countdown");
         setCountdownVal(3);
         break;
       case "NEXT_QUESTION":
         if (asHost) break;
         setCurrentQ(msg.qIndex);
+        currentQRef.current = msg.qIndex;
         setTimeLeft(msg.time);
         setSelectedAnswer(null);
         setShowCorrect(false);
         setWasCorrect(null);
         setScreen("question");
+        break;
+      case "NEXT_COUNTDOWN":
+        if (asHost) break;
+        setCurrentQ(msg.qIndex);
+        currentQRef.current = msg.qIndex;
+        setSelectedAnswer(null);
+        setShowCorrect(false);
+        setWasCorrect(null);
+        setScreen("countdown");
+        setCountdownVal(3);
+        break;
+      case "PLAYER_REJOIN":
+        if (!asHost) break;
+        setPlayers((prev) => {
+          const p = { ...prev };
+          if (!p[msg.name]) {
+            p[msg.name] = { score: 0, streak: 0, lastAnswer: null };
+          }
+          return p;
+        });
+        setTimeout(() => {
+          send({
+            type: "SYNC_STATE",
+            targetPlayer: msg.name,
+            screen: screenRef.current,
+            quiz: quizRef.current,
+            currentQ: currentQRef.current,
+            timeLeft: timeLeftRef.current,
+            players: playersRef.current,
+            showCorrect: showCorrectRef.current,
+          });
+        }, 500);
+        break;
+      case "SYNC_STATE":
+        if (asHost) break;
+        if (msg.targetPlayer && msg.targetPlayer !== playerName) break;
+        if (msg.quiz) setQuiz(msg.quiz);
+        if (msg.currentQ !== undefined) {
+          setCurrentQ(msg.currentQ);
+          currentQRef.current = msg.currentQ;
+        }
+        if (msg.timeLeft !== undefined) setTimeLeft(msg.timeLeft);
+        if (msg.players) {
+          setPlayers(msg.players);
+          const me = msg.players[playerName];
+          if (me) {
+            setMyScore(me.score || 0);
+            setMyStreak(me.streak || 0);
+          }
+        }
+        if (msg.showCorrect) setShowCorrect(true);
+        if (msg.screen) {
+          const s = msg.screen;
+          if (s === "host-lobby") {
+            setScreen("player-lobby");
+          } else if (s === "countdown") {
+            setScreen("countdown");
+            setCountdownVal(3);
+          } else if (s === "answer-result") {
+            setScreen("answer-result");
+            setShowCorrect(true);
+          } else {
+            setScreen(s);
+          }
+        }
         break;
       case "SHOW_RESULTS":
         if (asHost) break;
@@ -369,6 +444,11 @@ export default function App() {
     if (!joinCode || joinCode.length < 4) { setJoinError("Digite um código de sala válido."); return; }
     if (!playerName.trim()) { setJoinError("Digite seu nome."); return; }
     setJoinError("");
+    // Persist session info in URL for rejoin capability
+    const url = new URL(window.location);
+    url.searchParams.set('session', joinCode);
+    url.searchParams.set('name', playerName.trim());
+    window.history.replaceState({}, '', url);
     setRoomCode(joinCode);
     setIsHost(false);
     setMyScore(0);
@@ -376,10 +456,32 @@ export default function App() {
     setScreen("player-lobby");
   }
 
-  // Notify host about player joining
+  // Auto-rejoin from URL query params on page load
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionParam = params.get('session');
+    const nameParam = params.get('name');
+    if (sessionParam && nameParam) {
+      isRejoinRef.current = true;
+      setJoinCode(sessionParam);
+      setPlayerName(nameParam);
+      setRoomCode(sessionParam);
+      setIsHost(false);
+      setMyScore(0);
+      setMyStreak(0);
+      setScreen("player-lobby");
+    }
+  }, []);
+
+  // Notify host about player joining or rejoining
   useEffect(() => {
     if (screen === "player-lobby" && roomCode && playerName && !isHost) {
-      send({ type: "PLAYER_JOIN", name: playerName.trim() });
+      if (isRejoinRef.current) {
+        send({ type: "PLAYER_REJOIN", name: playerName.trim() });
+        isRejoinRef.current = false;
+      } else {
+        send({ type: "PLAYER_JOIN", name: playerName.trim() });
+      }
     }
   }, [screen, roomCode, playerName, isHost, send]);
 
@@ -394,7 +496,21 @@ export default function App() {
   useEffect(() => {
     if (screen !== "countdown") return;
     if (countdownVal < 0) {
-      if (isHost) startQuestion(0);
+      const qIdx = currentQRef.current;
+      if (isHostRef.current) {
+        startQuestion(qIdx);
+      } else {
+        // Player: transition to question locally using quiz data
+        const q = quizRef.current?.questions[qIdx];
+        if (q) {
+          setCurrentQ(qIdx);
+          setTimeLeft(q.time);
+          setSelectedAnswer(null);
+          setShowCorrect(false);
+          setWasCorrect(null);
+          setScreen("question");
+        }
+      }
       return;
     }
     const t = setTimeout(() => setCountdownVal((c) => c - 1), 1000);
@@ -465,14 +581,16 @@ export default function App() {
     if (nextQ >= quiz.questions.length) {
       handleShowFinal();
     } else {
-      // Show scoreboard to players, then countdown
+      // Show scoreboard briefly, then send countdown to all
       send({ type: "SHOW_SCOREBOARD", players });
-      setScreen("countdown");
-      setCountdownVal(3);
-      // After countdown finishes, startQuestion will be called via the countdown effect
-      // We need to queue the next question index
-      currentQRef.current = nextQ;
-      setTimeout(() => startQuestion(nextQ), 3600);
+      setScreen("scoreboard");
+      setTimeout(() => {
+        setCurrentQ(nextQ);
+        currentQRef.current = nextQ;
+        send({ type: "NEXT_COUNTDOWN", qIndex: nextQ });
+        setScreen("countdown");
+        setCountdownVal(3);
+      }, 2000);
     }
   }
 
@@ -499,6 +617,11 @@ export default function App() {
 
   function goHome() {
     clearInterval(timerRef.current);
+    // Clear URL params
+    const url = new URL(window.location);
+    url.searchParams.delete('session');
+    url.searchParams.delete('name');
+    window.history.replaceState({}, '', url);
     setScreen("home");
     setQuiz(null);
     setRoomCode("");
