@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { ref, push, onChildAdded, off, remove } from "firebase/database";
+import { ref, push, onChildAdded, off, remove, get, set } from "firebase/database";
+import { QRCodeSVG } from "qrcode.react";
 import { db } from "./firebase";
 import "./styles.css";
 
@@ -8,6 +9,18 @@ const generateRoomCode = () => String(Math.floor(100000 + Math.random() * 900000
 const COLORS = ["#e21b3c", "#1368ce", "#d89e00", "#26890c"];
 const SHAPES = ["▲", "◆", "●", "■"];
 const SENDER_ID = Math.random().toString(36).substring(2, 15);
+
+function getBaseUrl() {
+  return window.location.origin + window.location.pathname;
+}
+
+function encodeQuizToBase64(quiz) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(quiz))));
+}
+
+function decodeQuizFromBase64(encoded) {
+  return JSON.parse(decodeURIComponent(escape(atob(encoded))));
+}
 
 // ─── Firebase Communication Layer ───
 function useFirebase(roomCode, onMessage) {
@@ -215,6 +228,10 @@ export default function App() {
   const [jsonText, setJsonText] = useState(JSON_EXAMPLE);
   const [jsonError, setJsonError] = useState("");
   const [joinError, setJoinError] = useState("");
+  const [qrFullscreen, setQrFullscreen] = useState(false);
+  const [copySuccess, setCopySuccess] = useState(false);
+  const [shareLink, setShareLink] = useState("");
+  const [shareLinkCopied, setShareLinkCopied] = useState(false);
   const [myScore, setMyScore] = useState(0);
   const [myStreak, setMyStreak] = useState(0);
   const [lastPoints, setLastPoints] = useState(0);
@@ -428,6 +445,9 @@ export default function App() {
       // has messages from a previous session with the same code.
       try { await remove(ref(db, `rooms/${code}`)); } catch (_) { /* ignore */ }
 
+      // Write room meta so players can verify the room exists
+      await set(ref(db, `rooms/${code}/meta`), { active: true, title: parsed.title, createdAt: Date.now() });
+
       setQuiz(parsed);
       setRoomCode(code);
       setIsHost(true);
@@ -440,10 +460,23 @@ export default function App() {
   }
 
   // ─── Player: Join Room ───
-  function handleJoinRoom() {
+  async function handleJoinRoom() {
     if (!joinCode || joinCode.length < 4) { setJoinError("Digite um código de sala válido."); return; }
     if (!playerName.trim()) { setJoinError("Digite seu nome."); return; }
     setJoinError("");
+
+    // Check if room exists in Firebase
+    try {
+      const snapshot = await get(ref(db, `rooms/${joinCode}/meta`));
+      if (!snapshot.exists()) {
+        setJoinError("Sala não encontrada! Verifique o código e tente novamente.");
+        return;
+      }
+    } catch (_) {
+      setJoinError("Erro ao verificar sala. Tente novamente.");
+      return;
+    }
+
     // Persist session info in URL for rejoin capability
     const url = new URL(window.location);
     url.searchParams.set('session', joinCode);
@@ -456,9 +489,39 @@ export default function App() {
     setScreen("player-lobby");
   }
 
-  // Auto-rejoin from URL query params on page load
+  // Auto-rejoin and URL param handling on page load
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+
+    // Handle shared host quiz link: ?hostquiz=BASE64
+    const hostQuizParam = params.get('hostquiz');
+    if (hostQuizParam) {
+      try {
+        const decoded = decodeQuizFromBase64(hostQuizParam);
+        if (decoded && decoded.title && decoded.questions) {
+          setJsonText(JSON.stringify(decoded, null, 2));
+          // Clean URL
+          const url = new URL(window.location);
+          url.searchParams.delete('hostquiz');
+          window.history.replaceState({}, '', url);
+          setScreen("create");
+          return;
+        }
+      } catch (_) { /* invalid base64, fall through */ }
+    }
+
+    // Handle join link with pre-filled room code: ?join=ROOMCODE
+    const joinParam = params.get('join');
+    if (joinParam) {
+      setJoinCode(joinParam);
+      // Clean URL
+      const url = new URL(window.location);
+      url.searchParams.delete('join');
+      window.history.replaceState({}, '', url);
+      return;
+    }
+
+    // Existing rejoin logic
     const sessionParam = params.get('session');
     const nameParam = params.get('name');
     if (sessionParam && nameParam) {
@@ -615,6 +678,69 @@ export default function App() {
     .map(([name, data]) => ({ name, ...(data || {}) }))
     .sort((a, b) => (b.score || 0) - (a.score || 0));
 
+  // ─── Copy formatted ranking to clipboard ───
+  function copyRanking() {
+    const lines = [`🏆 ${quiz?.title || "QuizBlitz"} — Resultado Final\n`];
+    lines.push("─".repeat(36));
+    sortedPlayers.forEach((p, i) => {
+      const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}º`;
+      lines.push(`${medal} ${p.name} — ${p.score || 0} pts`);
+    });
+    lines.push("─".repeat(36));
+    lines.push(`\n📊 Total de jogadores: ${sortedPlayers.length}`);
+    lines.push(`🎯 Perguntas: ${quiz?.questions?.length || 0}`);
+    lines.push(`\n⚡ Gerado por QuizBlitz`);
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2500);
+    });
+  }
+
+  // ─── Generate share/host link for quiz ───
+  function generateShareLink() {
+    if (!quiz) return "";
+    const encoded = encodeQuizToBase64(quiz);
+    return `${getBaseUrl()}?hostquiz=${encoded}`;
+  }
+
+  function copyShareLink() {
+    const link = generateShareLink();
+    setShareLink(link);
+    navigator.clipboard.writeText(link).then(() => {
+      setShareLinkCopied(true);
+      setTimeout(() => setShareLinkCopied(false), 2500);
+    });
+  }
+
+  // ─── Generate share link from JSON text (create screen) ───
+  function generateShareLinkFromJson() {
+    try {
+      const parsed = JSON.parse(jsonText);
+      if (!parsed.title || !parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
+        setJsonError("JSON precisa ter 'title' e 'questions' (array não vazio).");
+        return;
+      }
+      for (let i = 0; i < parsed.questions.length; i++) {
+        const q = parsed.questions[i];
+        if (!q.question || !q.options || q.options.length < 2 || q.correct === undefined) {
+          setJsonError(`Pergunta ${i + 1} incompleta. Precisa de 'question', 'options' (2-4) e 'correct'.`);
+          return;
+        }
+        if (!q.time) q.time = 20;
+      }
+      setJsonError("");
+      const encoded = encodeQuizToBase64(parsed);
+      const link = `${getBaseUrl()}?hostquiz=${encoded}`;
+      setShareLink(link);
+      navigator.clipboard.writeText(link).then(() => {
+        setShareLinkCopied(true);
+        setTimeout(() => setShareLinkCopied(false), 2500);
+      });
+    } catch (e) {
+      setJsonError("JSON inválido: " + e.message);
+    }
+  }
+
   function goHome() {
     clearInterval(timerRef.current);
     // Clear URL params
@@ -631,6 +757,10 @@ export default function App() {
     setMyScore(0);
     setMyStreak(0);
     setShowConfetti(false);
+    setShareLink("");
+    setShareLinkCopied(false);
+    setCopySuccess(false);
+    setQrFullscreen(false);
   }
 
   // ════════════════════════════════════════════
@@ -701,10 +831,45 @@ export default function App() {
                 spellCheck={false}
               />
               {jsonError && <p className="error-box">⚠️ {jsonError}</p>}
-              <div style={{ marginTop: "16px", display: "flex", gap: "12px", justifyContent: "flex-end" }}>
+              <div style={{ marginTop: "16px", display: "flex", gap: "12px", justifyContent: "flex-end", flexWrap: "wrap" }}>
                 <Btn color="#666" onClick={() => setJsonText(JSON_EXAMPLE)}>Exemplo</Btn>
+                <Btn color="#1368ce" onClick={generateShareLinkFromJson}>
+                  {shareLinkCopied ? "✓ Link Copiado!" : "🔗 Gerar Link de Host"}
+                </Btn>
                 <Btn big color="#26890c" onClick={handleCreateQuiz}>Criar Sala 🚀</Btn>
               </div>
+              {shareLink && (
+                <div className="share-link-box" style={{ marginTop: "12px" }}>
+                  <p style={{ fontWeight: 700, fontSize: "14px", marginBottom: "6px" }}>🔗 Link de Host (copiado!):</p>
+                  <div className="share-link-text">{shareLink}</div>
+                  <p className="text-muted" style={{ fontSize: "12px", marginTop: "6px" }}>
+                    Quem abrir este link poderá criar uma sala com este quiz.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ═══ QR FULLSCREEN MODAL ═══ */}
+        {qrFullscreen && (
+          <div className="qr-fullscreen-overlay" onClick={() => setQrFullscreen(false)}>
+            <div className="qr-fullscreen-content" onClick={(e) => e.stopPropagation()}>
+              <QRCodeSVG
+                value={`${getBaseUrl()}?join=${roomCode}`}
+                size={Math.min(window.innerWidth * 0.75, window.innerHeight * 0.6, 500)}
+                bgColor="#ffffff"
+                fgColor="#1a0533"
+                level="M"
+                includeMargin
+              />
+              <p className="qr-fullscreen-code">{roomCode}</p>
+              <p className="text-muted" style={{ marginTop: "8px", fontSize: "16px" }}>
+                Escaneie para entrar na sala
+              </p>
+              <Btn color="#666" onClick={() => setQrFullscreen(false)} style={{ marginTop: "16px" }}>
+                Fechar
+              </Btn>
             </div>
           </div>
         )}
@@ -716,6 +881,21 @@ export default function App() {
               <p className="label-upper">Código da Sala</p>
               <div className="room-code-display">{roomCode}</div>
               <p className="text-muted" style={{ marginTop: "4px" }}>📋 Compartilhe este código</p>
+            </div>
+
+            {/* QR Code */}
+            <div className="qr-card anim-slide-up" onClick={() => setQrFullscreen(true)} title="Clique para expandir">
+              <QRCodeSVG
+                value={`${getBaseUrl()}?join=${roomCode}`}
+                size={160}
+                bgColor="#ffffff"
+                fgColor="#1a0533"
+                level="M"
+                includeMargin
+              />
+              <p className="text-muted" style={{ marginTop: "8px", fontSize: "13px" }}>
+                📱 Escaneie ou clique para expandir
+              </p>
             </div>
             <div className="glass-card anim-slide-up-d2" style={{ width: "100%", maxWidth: "500px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
@@ -1025,9 +1205,18 @@ export default function App() {
                 </div>
               ))}
             </div>
-            <Btn big color="#e21b3c" onClick={goHome} style={{ marginTop: "30px" }}>
-              🏠 Voltar ao Início
-            </Btn>
+            {/* Action buttons */}
+            <div className="final-actions">
+              <Btn color="#1368ce" onClick={copyRanking}>
+                {copySuccess ? "✓ Copiado!" : "📋 Copiar Ranking"}
+              </Btn>
+              <Btn color="#d89e00" onClick={copyShareLink}>
+                {shareLinkCopied ? "✓ Link Copiado!" : "🔗 Compartilhar Quiz"}
+              </Btn>
+              <Btn big color="#e21b3c" onClick={goHome}>
+                🏠 Voltar ao Início
+              </Btn>
+            </div>
           </div>
         )}
       </div>
