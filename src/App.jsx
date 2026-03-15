@@ -331,6 +331,7 @@ export default function App() {
       case "NEXT_QUESTION":
         if (asHost) break;
         setCurrentQ(msg.qIndex);
+        setQuiz(msg.quiz);
         currentQRef.current = msg.qIndex;
         setTimeLeft(msg.time);
         setSelectedAnswer(null);
@@ -595,9 +596,14 @@ export default function App() {
 
   // ─── Countdown ───
   useEffect(() => {
+    console.log("countdownVal ----------> ", countdownVal);
+    console.log("quiz ----------> ", JSON.stringify(quiz, null, 2));
+    console.log("roomCode ----------> ", roomCode);
+
     if (screen !== "countdown") return;
     if (countdownVal < 0) {
       const qIdx = currentQRef.current;
+      console.log("qIdx ---> ", qIdx);
       if (isHostRef.current) {
         startQuestion(qIdx);
       } else {
@@ -648,7 +654,7 @@ export default function App() {
         }
         return p;
       });
-      send({ type: "NEXT_QUESTION", qIndex, time: q.time });
+      send({ type: "NEXT_QUESTION", qIndex, time: q.time, quiz });
       clearInterval(timerRef.current);
       let tl = q.time;
       timerRef.current = setInterval(() => {
