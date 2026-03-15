@@ -236,6 +236,7 @@ export default function App() {
   const [myStreak, setMyStreak] = useState(0);
   const [lastPoints, setLastPoints] = useState(0);
   const [wasCorrect, setWasCorrect] = useState(null);
+  const [isSpectating, setIsSpectating] = useState(false);
   const timerRef = useRef(null);
   const quizRef = useRef(null);
   const currentQRef = useRef(0);
@@ -264,7 +265,27 @@ export default function App() {
       // ── Messages only the HOST should process (sent by players) ──
       case "PLAYER_JOIN":
         if (!asHost) break;
-        setPlayers((prev) => ({ ...prev, [msg.name]: { score: 0, streak: 0, lastAnswer: null } }));
+        setPlayers((prev) => {
+          // If the player already exists (rejoining by name), keep their score
+          if (prev[msg.name]) return prev;
+          return { ...prev, [msg.name]: { score: 0, streak: 0, lastAnswer: null } };
+        });
+        // If quiz is in progress (not in lobby), send SYNC_STATE so the late joiner
+        // gets the current game state
+        if (screenRef.current !== "host-lobby") {
+          setTimeout(() => {
+            send({
+              type: "SYNC_STATE",
+              targetPlayer: msg.name,
+              screen: screenRef.current,
+              quiz: quizRef.current,
+              currentQ: currentQRef.current,
+              timeLeft: timeLeftRef.current,
+              players: playersRef.current,
+              showCorrect: showCorrectRef.current,
+            });
+          }, 500);
+        }
         break;
       case "PLAYER_ANSWER":
         if (!asHost) break;
@@ -303,6 +324,7 @@ export default function App() {
         setQuiz(msg.quiz);
         setCurrentQ(0);
         currentQRef.current = 0;
+        setIsSpectating(false);
         setScreen("countdown");
         setCountdownVal(3);
         break;
@@ -314,6 +336,7 @@ export default function App() {
         setSelectedAnswer(null);
         setShowCorrect(false);
         setWasCorrect(null);
+        setIsSpectating(false);
         setScreen("question");
         break;
       case "NEXT_COUNTDOWN":
@@ -323,6 +346,7 @@ export default function App() {
         setSelectedAnswer(null);
         setShowCorrect(false);
         setWasCorrect(null);
+        setIsSpectating(false);
         setScreen("countdown");
         setCountdownVal(3);
         break;
@@ -370,14 +394,25 @@ export default function App() {
           const s = msg.screen;
           if (s === "host-lobby") {
             setScreen("player-lobby");
+            setIsSpectating(false);
           } else if (s === "countdown") {
             setScreen("countdown");
             setCountdownVal(3);
+            setIsSpectating(false);
+          } else if (s === "question") {
+            // Player joined mid-question: show question but can't answer
+            setScreen("question");
+            setIsSpectating(true);
           } else if (s === "answer-result") {
             setScreen("answer-result");
             setShowCorrect(true);
+            setIsSpectating(false);
+          } else if (s === "scoreboard") {
+            setScreen("scoreboard");
+            setIsSpectating(false);
           } else {
             setScreen(s);
+            setIsSpectating(false);
           }
         }
         break;
@@ -394,16 +429,19 @@ export default function App() {
           }
         }
         setShowCorrect(true);
+        setIsSpectating(false);
         setScreen("answer-result");
         break;
       case "SHOW_SCOREBOARD":
         if (asHost) break;
         if (msg.players && typeof msg.players === "object") setPlayers(msg.players);
+        setIsSpectating(false);
         setScreen("scoreboard");
         break;
       case "SHOW_FINAL":
         if (asHost) break;
         if (msg.players && typeof msg.players === "object") setPlayers(msg.players);
+        setIsSpectating(false);
         setScreen("final");
         break;
       case "TIME_UPDATE":
@@ -759,6 +797,7 @@ export default function App() {
     setIsHost(false);
     setMyScore(0);
     setMyStreak(0);
+    setIsSpectating(false);
     setShowConfetti(false);
     setShareLink("");
     setShareLinkCopied(false);
@@ -997,11 +1036,12 @@ export default function App() {
             <div className={`options-grid ${quiz.questions[currentQ]?.options.length <= 2 ? "options-single" : ""}`}>
               {quiz.questions[currentQ]?.options.map((opt, i) => {
                 const isSelected = selectedAnswer === i;
-                const disabled = selectedAnswer !== null || isHost;
+                const disabled = selectedAnswer !== null || isHost || isSpectating;
                 const correct = quiz.questions[currentQ].correct === i;
                 let bg = COLORS[i];
                 if (showCorrect) bg = correct ? "#26890c" : "rgba(100,100,100,0.4)";
                 else if (isSelected) bg = adjustColor(COLORS[i], -30);
+                else if (isSpectating) bg = adjustColor(COLORS[i], -20);
 
                 return (
                   <button
@@ -1016,7 +1056,7 @@ export default function App() {
                         : `0 4px 0 ${adjustColor(bg, -40)}`,
                       transform: isSelected ? "scale(0.97)" : "scale(1)",
                       animationDelay: `${i * 0.08}s`,
-                      opacity: showCorrect && !correct ? 0.5 : 1,
+                      opacity: (showCorrect && !correct) || isSpectating ? 0.5 : 1,
                     }}
                   >
                     <span className="option-shape">{SHAPES[i]}</span>
@@ -1043,8 +1083,16 @@ export default function App() {
               </div>
             )}
 
+            {/* Player spectating (joined mid-question) */}
+            {!isHost && isSpectating && (
+              <div className="waiting-badge anim-pop">
+                <p style={{ fontWeight: 700, fontSize: "18px" }}>👀 Você entrou no meio da pergunta</p>
+                <p style={{ fontSize: "14px", opacity: 0.8, marginTop: "4px" }}>Aguarde a próxima pergunta para participar!</p>
+              </div>
+            )}
+
             {/* Player waiting */}
-            {!isHost && selectedAnswer !== null && !showCorrect && (
+            {!isHost && !isSpectating && selectedAnswer !== null && !showCorrect && (
               <div className="waiting-badge anim-pop">
                 <p style={{ fontWeight: 700, fontSize: "18px" }}>✓ Resposta enviada! Aguardando...</p>
               </div>
