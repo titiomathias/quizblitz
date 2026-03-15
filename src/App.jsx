@@ -563,8 +563,11 @@ export default function App() {
       if (isHostRef.current) {
         startQuestion(qIdx);
       } else {
-        // Player: transition to question locally using quiz data
-        const q = quizRef.current?.questions[qIdx];
+        // Player: transition to question locally using quiz data.
+        // Uses `quiz` state (not quizRef) so the effect re-runs when quiz
+        // becomes available after a page reload (SYNC_STATE may arrive after
+        // NEXT_COUNTDOWN has already started the countdown with quiz still null).
+        const q = quiz?.questions[qIdx];
         if (q) {
           setCurrentQ(qIdx);
           setTimeLeft(q.time);
@@ -578,7 +581,7 @@ export default function App() {
     }
     const t = setTimeout(() => setCountdownVal((c) => c - 1), 1000);
     return () => clearTimeout(t);
-  }, [screen, countdownVal]);
+  }, [screen, countdownVal, quiz]);
 
   // ─── Start question ───
   function startQuestion(qIndex) {
