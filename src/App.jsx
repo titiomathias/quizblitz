@@ -637,9 +637,23 @@ export default function App() {
     setShowCorrect(false);
     setAnsweredCount(0);
     setWasCorrect(null);
+    setLastPoints(0);
     setScreen("question");
 
     if (isHost) {
+      // Reset per-question fields so unanswered players don't carry stale results
+      setPlayers((prev) => {
+        const p = { ...prev };
+        for (const name of Object.keys(p)) {
+          p[name] = {
+            ...p[name],
+            lastAnswer: null,
+            lastCorrect: null,
+            lastPoints: 0,
+          };
+        }
+        return p;
+      });
       send({ type: "NEXT_QUESTION", qIndex, time: q.time, quiz });
       clearInterval(timerRef.current);
       let tl = q.time;
@@ -658,10 +672,23 @@ export default function App() {
   function handleTimeUp() {
     clearInterval(timerRef.current);
     if (isHost) {
-      const p = playersRef.current;
-      send({ type: "SHOW_RESULTS", players: p });
-      setShowCorrect(true);
-      setScreen("answer-result");
+      // Reset streak for players who didn't answer (lastAnswer is null from startQuestion reset)
+      setPlayers((prev) => {
+        const p = { ...prev };
+        for (const name of Object.keys(p)) {
+          if (p[name].lastAnswer === null) {
+            p[name] = { ...p[name], streak: 0 };
+          }
+        }
+        return p;
+      });
+      // Use setTimeout to ensure state update is applied before reading
+      setTimeout(() => {
+        const p = playersRef.current;
+        send({ type: "SHOW_RESULTS", players: p });
+        setShowCorrect(true);
+        setScreen("answer-result");
+      }, 0);
     }
   }
 
@@ -1113,10 +1140,10 @@ export default function App() {
             style={{ animation: wasCorrect ? "correctFlash 1s ease" : wasCorrect === false ? "wrongShake 0.5s ease" : "none" }}
           >
             <div className="anim-pop" style={{ fontSize: "clamp(60px, 12vw, 100px)" }}>
-              {wasCorrect ? "🎉" : "😢"}
+              {wasCorrect ? "🎉" : wasCorrect === false ? "😢" : "⏱"}
             </div>
             <h2 className="result-title" style={{ color: wasCorrect ? "#6bcb77" : "#ff6b6b" }}>
-              {wasCorrect ? "Correto!" : "Incorreto!"}
+              {wasCorrect ? "Correto!" : wasCorrect === false ? "Incorreto!" : "Tempo esgotado!"}
             </h2>
             {wasCorrect && lastPoints > 0 && (
               <div className="points-badge anim-pop-d2">+{lastPoints} pts</div>
