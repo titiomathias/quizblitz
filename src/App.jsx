@@ -222,7 +222,7 @@ export default function App() {
   const [timeLeft, setTimeLeft] = useState(0);
   const [selectedAnswer, setSelectedAnswer] = useState(null);
   const [showCorrect, setShowCorrect] = useState(false);
-  const [countdownVal, setCountdownVal] = useState(3);
+  const [countdownVal, setCountdownVal] = useState(-1);
   const [answeredCount, setAnsweredCount] = useState(0);
   const [showConfetti, setShowConfetti] = useState(false);
   const [jsonText, setJsonText] = useState(JSON_EXAMPLE);
@@ -246,6 +246,7 @@ export default function App() {
   const screenRef = useRef("home");
   const showCorrectRef = useRef(false);
   const isRejoinRef = useRef(false);
+  const playerListTimerRef = useRef(null);
 
   // Keep refs in sync
   useEffect(() => { quizRef.current = quiz; }, [quiz]);
@@ -454,10 +455,13 @@ export default function App() {
 
   const send = useFirebase(roomCode || joinCode, handleMessage);
 
-  // Sync player list to clients
+  // Sync player list to clients (debounced to avoid flooding Firebase on rapid joins)
   useEffect(() => {
     if (isHost && Object.keys(players).length > 0) {
-      send({ type: "PLAYER_LIST", players });
+      clearTimeout(playerListTimerRef.current);
+      playerListTimerRef.current = setTimeout(() => {
+        send({ type: "PLAYER_LIST", players });
+      }, 300);
     }
   }, [players, isHost, send]);
 
@@ -596,14 +600,9 @@ export default function App() {
 
   // ─── Countdown ───
   useEffect(() => {
-    console.log("countdownVal ----------> ", countdownVal);
-    console.log("quiz ----------> ", JSON.stringify(quiz, null, 2));
-    console.log("roomCode ----------> ", roomCode);
-
     if (screen !== "countdown") return;
     if (countdownVal < 0) {
       const qIdx = currentQRef.current;
-      console.log("qIdx ---> ", qIdx);
       if (isHostRef.current) {
         startQuestion(qIdx);
       } else {
