@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { ref, push, onChildAdded, off, remove, get, set } from "firebase/database";
+import { ref, push, onChildAdded, off, remove, get, set, query, orderByKey, startAfter, limitToLast } from "firebase/database";
 import { QRCodeSVG } from "qrcode.react";
 import { db } from "./firebase";
 import "./styles.css";
@@ -31,32 +31,62 @@ function useFirebase(roomCode, onMessage) {
     if (!roomCode || roomCode.length < 6) return;
     const messagesRef = ref(db, `rooms/${roomCode}/messages`);
 
-    // Record when the listener was attached so we can skip messages that
-    // already existed in Firebase (prevents stale-message replay on attach
-    // and covers the race window between remove() and onChildAdded()).
-    const attachedAt = Date.now();
+    let cancelled = false;
+    let detach = null;
 
-    const callback = (snapshot) => {
-      const msg = snapshot.val();
-      if (!msg) return;
-      // Skip messages older than 5 s relative to when we attached.
-      // This discards any pre-existing children fired by onChildAdded on
-      // attach, while still accepting messages sent around the same time.
-      if (msg.ts && msg.ts < attachedAt - 5000) return;
-      if (msg.senderId !== SENDER_ID) {
-        onMessageRef.current(msg);
+    // Use Firebase key-based filtering instead of timestamp-based to avoid
+    // clock skew between devices (the old approach silently dropped messages
+    // when a player's device clock was ahead of the host's by > 5 seconds).
+    // Firebase push keys are server-ordered, so startAfter(lastKey) reliably
+    // skips pre-existing messages regardless of client clock differences.
+    const lastKeyQuery = query(messagesRef, orderByKey(), limitToLast(1));
+    get(lastKeyQuery).then((snapshot) => {
+      if (cancelled) return;
+
+      let listenQuery;
+      if (snapshot.exists()) {
+        let lastKey = null;
+        snapshot.forEach((child) => { lastKey = child.key; });
+        listenQuery = query(messagesRef, orderByKey(), startAfter(lastKey));
+      } else {
+        listenQuery = messagesRef;
       }
+
+      const callback = (childSnapshot) => {
+        const msg = childSnapshot.val();
+        if (!msg) return;
+        if (msg.senderId !== SENDER_ID) {
+          onMessageRef.current(msg);
+        }
+      };
+
+      onChildAdded(listenQuery, callback);
+      detach = () => off(listenQuery, "child_added", callback);
+    }).catch(() => {
+      // Fallback: listen to all messages with a generous time tolerance
+      if (cancelled) return;
+      const attachedAt = Date.now();
+      const callback = (childSnapshot) => {
+        const msg = childSnapshot.val();
+        if (!msg) return;
+        if (msg.ts && msg.ts < attachedAt - 30000) return;
+        if (msg.senderId !== SENDER_ID) {
+          onMessageRef.current(msg);
+        }
+      };
+      onChildAdded(messagesRef, callback);
+      detach = () => off(messagesRef, "child_added", callback);
+    });
+
+    return () => {
+      cancelled = true;
+      if (detach) detach();
     };
-
-    onChildAdded(messagesRef, callback);
-
-    return () => off(messagesRef, "child_added", callback);
   }, [roomCode]);
 
   const send = useCallback((msg) => {
     if (!roomCode) return;
     const messagesRef = ref(db, `rooms/${roomCode}/messages`);
-    // Include a client-side timestamp so receivers can filter stale messages.
     push(messagesRef, { ...msg, senderId: SENDER_ID, ts: Date.now() });
   }, [roomCode]);
 
@@ -670,24 +700,20 @@ export default function App() {
 
   function handleTimeUp() {
     clearInterval(timerRef.current);
-    if (isHost) {
-      // Reset streak for players who didn't answer (lastAnswer is null from startQuestion reset)
-      setPlayers((prev) => {
-        const p = { ...prev };
-        for (const name of Object.keys(p)) {
-          if (p[name].lastAnswer === null) {
-            p[name] = { ...p[name], streak: 0 };
-          }
+    if (isHostRef.current) {
+      // Compute final player state synchronously: reset streak for unanswered
+      // players and send SHOW_RESULTS immediately (avoids stale-ref race that
+      // caused some players' scores to show as 0 on the host screen).
+      const finalPlayers = { ...playersRef.current };
+      for (const name of Object.keys(finalPlayers)) {
+        if (finalPlayers[name].lastAnswer === null) {
+          finalPlayers[name] = { ...finalPlayers[name], streak: 0 };
         }
-        return p;
-      });
-      // Use setTimeout to ensure state update is applied before reading
-      setTimeout(() => {
-        const p = playersRef.current;
-        send({ type: "SHOW_RESULTS", players: p });
-        setShowCorrect(true);
-        setScreen("answer-result");
-      }, 0);
+      }
+      setPlayers(finalPlayers);
+      send({ type: "SHOW_RESULTS", players: finalPlayers });
+      setShowCorrect(true);
+      setScreen("answer-result");
     }
   }
 
@@ -695,21 +721,16 @@ export default function App() {
   function handleSelectAnswer(idx) {
     if (selectedAnswer !== null) return;
     setSelectedAnswer(idx);
-    const q = quiz.questions[currentQ];
-    const correct = idx === q.correct;
-    const pts = correct ? calcScore(timeLeft, q.time) : 0;
-    const newStreak = correct ? myStreak + 1 : 0;
-    const bonus = newStreak >= 3 ? Math.round(pts * 0.1) : 0;
-    setLastPoints(pts + bonus);
-    setWasCorrect(correct);
-    setMyScore((s) => s + pts + bonus);
-    setMyStreak(newStreak);
+    // Only send the answer to the host. Score, streak, and correctness are
+    // NOT updated here — they will arrive via SHOW_RESULTS from the host once
+    // the timer expires or the host reveals the answer. This prevents the
+    // player's score from updating prematurely before the question ends.
     send({ type: "PLAYER_ANSWER", name: playerName, answer: idx, timeLeft });
   }
 
   function handleShowScoreboard() {
     setScreen("scoreboard");
-    send({ type: "SHOW_SCOREBOARD", players });
+    send({ type: "SHOW_SCOREBOARD", players: playersRef.current });
   }
 
   function handleNextQuestion() {
@@ -718,7 +739,7 @@ export default function App() {
       handleShowFinal();
     } else {
       // Show scoreboard briefly, then send countdown to all
-      send({ type: "SHOW_SCOREBOARD", players });
+      send({ type: "SHOW_SCOREBOARD", players: playersRef.current });
       setScreen("scoreboard");
       setTimeout(() => {
         setCurrentQ(nextQ);
@@ -733,15 +754,23 @@ export default function App() {
   function handleShowFinal() {
     setScreen("final");
     setShowConfetti(true);
-    send({ type: "SHOW_FINAL", players });
+    send({ type: "SHOW_FINAL", players: playersRef.current });
     setTimeout(() => setShowConfetti(false), 5000);
   }
 
   function handleRevealAnswer() {
     clearInterval(timerRef.current);
+    // Reset streak for unanswered players (same logic as handleTimeUp)
+    const finalPlayers = { ...playersRef.current };
+    for (const name of Object.keys(finalPlayers)) {
+      if (finalPlayers[name].lastAnswer === null) {
+        finalPlayers[name] = { ...finalPlayers[name], streak: 0 };
+      }
+    }
+    setPlayers(finalPlayers);
     setShowCorrect(true);
     setScreen("answer-result");
-    send({ type: "SHOW_RESULTS", players });
+    send({ type: "SHOW_RESULTS", players: finalPlayers });
   }
 
   const sortedPlayers = (players && typeof players === "object" && !Array.isArray(players)
