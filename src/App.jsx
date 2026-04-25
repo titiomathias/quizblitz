@@ -18,8 +18,15 @@ function encodeQuizToBase64(quiz) {
   return btoa(unescape(encodeURIComponent(JSON.stringify(quiz))));
 }
 
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function safeReviver(key, value) {
+  if (FORBIDDEN_KEYS.has(key)) return undefined;
+  return value;
+}
+
 function decodeQuizFromBase64(encoded) {
-  return JSON.parse(decodeURIComponent(escape(atob(encoded))));
+  return JSON.parse(decodeURIComponent(escape(atob(encoded))), safeReviver);
 }
 
 // ─── Firebase Communication Layer ───
@@ -296,9 +303,10 @@ export default function App() {
       // ── Messages only the HOST should process (sent by players) ──
       case "PLAYER_JOIN":
         if (!asHost) break;
+        if (!msg.name || FORBIDDEN_KEYS.has(msg.name)) break;
         setPlayers((prev) => {
           // If the player already exists (rejoining by name), keep their score
-          if (prev[msg.name]) return prev;
+          if (Object.prototype.hasOwnProperty.call(prev, msg.name)) return prev;
           return { ...prev, [msg.name]: { score: 0, streak: 0, lastAnswer: null } };
         });
         // If quiz is in progress (not in lobby), send SYNC_STATE so the late joiner
@@ -322,7 +330,7 @@ export default function App() {
         if (!asHost) break;
         setPlayers((prev) => {
           const p = { ...prev };
-          if (p[msg.name]) {
+          if (Object.prototype.hasOwnProperty.call(p, msg.name)) {
             const q = quizRef.current?.questions[currentQRef.current];
             if (!q) return p;
             const correct = msg.answer === q.correct;
@@ -384,9 +392,10 @@ export default function App() {
         break;
       case "PLAYER_REJOIN":
         if (!asHost) break;
+        if (!msg.name || FORBIDDEN_KEYS.has(msg.name)) break;
         setPlayers((prev) => {
           const p = { ...prev };
-          if (!p[msg.name]) {
+          if (!Object.prototype.hasOwnProperty.call(p, msg.name)) {
             p[msg.name] = { score: 0, streak: 0, lastAnswer: null };
           }
           return p;
@@ -498,7 +507,7 @@ export default function App() {
   // ─── Host: Create Room ───
   async function handleCreateQuiz() {
     try {
-      const parsed = JSON.parse(jsonText);
+      const parsed = JSON.parse(jsonText, safeReviver);
       if (!parsed.title || !parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
         setJsonError("JSON precisa ter 'title' e 'questions' (array não vazio).");
         return;
@@ -817,7 +826,7 @@ export default function App() {
   // ─── Generate share link from JSON text (create screen) ───
   function generateShareLinkFromJson() {
     try {
-      const parsed = JSON.parse(jsonText);
+      const parsed = JSON.parse(jsonText, safeReviver);
       if (!parsed.title || !parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
         setJsonError("JSON precisa ter 'title' e 'questions' (array não vazio).");
         return;
